@@ -1,0 +1,423 @@
+import sys
+import re
+import socket
+import ssl
+import json
+import time
+import random
+import string
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from typing import Optional
+
+import requests
+from bs4 import BeautifulSoup
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+TIMEOUT = 8
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+FINDINGS = []
+
+# ──────────────────────────────────────────────
+# PROMPT INTERACTIF
+# ──────────────────────────────────────────────
+BANNER = r"""
+  ╔═══════════════════════════════════════╗
+  ║         WEB VULN SCANNER              ║
+  ║   XSS · SQLi · IDOR · CSRF · LFI      ║
+  ║   Open Redirect · Headers · Files     ║
+  ╚═══════════════════════════════════════╝
+"""
+
+def prompt_target() -> str:
+    print(BANNER)
+    while True:
+        raw = input("  Cible (URL) : ").strip()
+        if not raw:
+            print("  [!] Champ vide — entre une URL.\n")
+            continue
+        if not raw.startswith("http"):
+            raw = "https://" + raw
+        # validation basique
+        parsed = urlparse(raw)
+        if not parsed.netloc:
+            print("  [!] URL invalide — exemple : https://example.com\n")
+            continue
+        return raw.rstrip("/")
+
+def get_target() -> str:
+    """Retourne la cible : arg CLI ou prompt interactif."""
+    if len(sys.argv) >= 2:
+        t = sys.argv[1].rstrip("/")
+        if not t.startswith("http"):
+            t = "https://" + t
+        return t
+    return prompt_target()
+
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
+def get(url: str, params=None, headers=None, allow_redirects=True) -> Optional[requests.Response]:
+    try:
+        h = {**HEADERS, **(headers or {})}
+        return requests.get(url, params=params, headers=h, timeout=TIMEOUT,
+                            verify=False, allow_redirects=allow_redirects)
+    except Exception:
+        return None
+
+def post(url: str, data=None, headers=None) -> Optional[requests.Response]:
+    try:
+        h = {**HEADERS, **(headers or {})}
+        return requests.post(url, data=data, headers=h, timeout=TIMEOUT, verify=False)
+    except Exception:
+        return None
+
+def add_finding(vuln: str, detail: str, url: str, severity: str = "HIGH"):
+    entry = {"vuln": vuln, "severity": severity, "url": url, "detail": detail}
+    FINDINGS.append(entry)
+    color = "\033[91m" if severity == "HIGH" else "\033[93m"
+    print(f"{color}[{severity}] {vuln}\033[0m")
+    print(f"       URL    : {url}")
+    print(f"       Détail : {detail}\n")
+
+def rand_str(n=8) -> str:
+    return ''.join(random.choices(string.ascii_lowercase, k=n))
+
+# ──────────────────────────────────────────────
+# 1. CRAWL
+# ──────────────────────────────────────────────
+def crawl(base_url: str) -> tuple[list[str], list[dict]]:
+    visited, to_visit = set(), {base_url}
+    forms_found = []
+    domain = urlparse(base_url).netloc
+
+    while to_visit:
+        url = to_visit.pop()
+        if url in visited:
+            continue
+        visited.add(url)
+        r = get(url)
+        if not r or "text/html" not in r.headers.get("Content-Type", ""):
+            continue
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for tag in soup.find_all("a", href=True):
+            abs_url = urljoin(url, tag["href"])
+            p = urlparse(abs_url)
+            if p.netloc == domain and abs_url not in visited:
+                to_visit.add(abs_url.split("#")[0])
+
+        for form in soup.find_all("form"):
+            action = urljoin(url, form.get("action", url))
+            method = form.get("method", "get").lower()
+            inputs = {}
+            for inp in form.find_all(["input", "textarea", "select"]):
+                name = inp.get("name")
+                if name:
+                    inputs[name] = inp.get("value", "test")
+            if inputs:
+                forms_found.append({"action": action, "method": method,
+                                    "inputs": inputs, "page": url})
+
+    print(f"[*] Crawl terminé — {len(visited)} pages, {len(forms_found)} formulaires\n")
+    return list(visited), forms_found
+
+# ──────────────────────────────────────────────
+# 2. XSS
+# ──────────────────────────────────────────────
+XSS_PAYLOADS = [
+    '<script>alert(1)</script>',
+    '"><script>alert(1)</script>',
+    "'><img src=x onerror=alert(1)>",
+    '<svg onload=alert(1)>',
+    '"><svg/onload=alert(1)>',
+]
+
+def check_xss(urls: list[str], forms: list[dict]):
+    print("[*] XSS réfléchi...")
+    for url in urls:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        if not params:
+            continue
+        for param in params:
+            for payload in XSS_PAYLOADS:
+                test_params = {**{k: v[0] for k, v in params.items()}, param: payload}
+                r = get(url, params=test_params)
+                if r and payload in r.text:
+                    add_finding("XSS Réfléchi", f"param='{param}', payload={payload}", r.url)
+                    break
+
+    for form in forms:
+        for field in form["inputs"]:
+            for payload in XSS_PAYLOADS:
+                data = {**form["inputs"], field: payload}
+                r = post(form["action"], data=data) if form["method"] == "post" \
+                    else get(form["action"], params=data)
+                if r and payload in r.text:
+                    add_finding("XSS Réfléchi (form)",
+                                f"action='{form['action']}', field='{field}'",
+                                form["action"])
+                    break
+
+# ──────────────────────────────────────────────
+# 3. SQLi
+# ──────────────────────────────────────────────
+SQL_ERRORS = [
+    "you have an error in your sql syntax",
+    "warning: mysql", "unclosed quotation mark",
+    "quoted string not properly terminated",
+    "odbc microsoft access driver", "ora-01756",
+    "pg::syntaxerror", "sqlite3::exception",
+    "microsoft ole db provider for sql server",
+]
+SQL_PAYLOADS = ["'", '"', "' OR '1'='1", "' OR 1=1--", '" OR "1"="1']
+
+def check_sqli(urls: list[str], forms: list[dict]):
+    print("[*] SQLi...")
+    for url in urls:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        if not params:
+            continue
+        for param in params:
+            baseline = get(url)
+            baseline_len = len(baseline.text) if baseline else 0
+            for payload in SQL_PAYLOADS:
+                test_params = {**{k: v[0] for k, v in params.items()}, param: payload}
+                r = get(url, params=test_params)
+                if not r:
+                    continue
+                if any(e in r.text.lower() for e in SQL_ERRORS):
+                    add_finding("SQLi Error-Based", f"param='{param}', payload={repr(payload)}", r.url)
+                    break
+                diff = abs(len(r.text) - baseline_len)
+                if baseline_len and (diff / baseline_len) > 0.2:
+                    add_finding("SQLi Blind", f"param='{param}', delta={diff}", r.url, "MEDIUM")
+                    break
+
+    for form in forms:
+        for field in form["inputs"]:
+            baseline = post(form["action"], data=form["inputs"]) if form["method"] == "post" \
+                       else get(form["action"], params=form["inputs"])
+            baseline_len = len(baseline.text) if baseline else 0
+            for payload in SQL_PAYLOADS:
+                data = {**form["inputs"], field: payload}
+                r = post(form["action"], data=data) if form["method"] == "post" \
+                    else get(form["action"], params=data)
+                if not r:
+                    continue
+                if any(e in r.text.lower() for e in SQL_ERRORS):
+                    add_finding("SQLi Error-Based (form)",
+                                f"field='{field}', payload={repr(payload)}", form["action"])
+                    break
+
+# ──────────────────────────────────────────────
+# 4. OPEN REDIRECT
+# ──────────────────────────────────────────────
+REDIRECT_PARAMS = ["redirect", "url", "next", "return", "returnUrl", "goto",
+                   "redir", "destination", "target", "link", "out"]
+
+def check_open_redirect(urls: list[str]):
+    print("[*] Open Redirect...")
+    for url in urls:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        candidates = [p for p in params if p.lower() in [x.lower() for x in REDIRECT_PARAMS]]
+        for param in (candidates or list(params.keys())):
+            test_params = {**{k: v[0] for k, v in params.items()}, param: "https://evil.com"}
+            r = get(url, params=test_params, allow_redirects=False)
+            if r and r.status_code in (301, 302, 303, 307, 308):
+                if "evil.com" in r.headers.get("Location", ""):
+                    add_finding("Open Redirect", f"param='{param}'", r.url, "MEDIUM")
+
+# ──────────────────────────────────────────────
+# 5. HEADERS
+# ──────────────────────────────────────────────
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": "HSTS absent — downgrade/MitM possible",
+    "X-Content-Type-Options": "MIME sniffing actif",
+    "X-Frame-Options": "Clickjacking possible",
+    "Content-Security-Policy": "Pas de CSP — XSS facilité",
+    "Permissions-Policy": "Permissions browser non restreintes",
+}
+
+def check_headers(base_url: str):
+    print("[*] Security headers...")
+    r = get(base_url)
+    if not r:
+        return
+    for header, impact in SECURITY_HEADERS.items():
+        if header not in r.headers:
+            add_finding(f"Header manquant: {header}", impact, base_url, "MEDIUM")
+
+# ──────────────────────────────────────────────
+# 6. IDOR
+# ──────────────────────────────────────────────
+def check_idor(urls: list[str]):
+    print("[*] IDOR...")
+    pattern = re.compile(r'(\d+)')
+    for url in urls:
+        parsed = urlparse(url)
+        for match in pattern.finditer(parsed.path):
+            orig_id = int(match.group(1))
+            if orig_id < 2:
+                continue
+            tampered_path = parsed.path[:match.start()] + str(orig_id - 1) + parsed.path[match.end():]
+            tampered_url = urlunparse(parsed._replace(path=tampered_path))
+            r_orig = get(url)
+            r_tamp = get(tampered_url)
+            if r_orig and r_tamp and r_tamp.status_code == 200:
+                if len(r_tamp.text) > 100 and r_tamp.text != r_orig.text:
+                    add_finding("IDOR potentiel",
+                                f"ID {orig_id} → {orig_id-1} accessible",
+                                tampered_url, "MEDIUM")
+
+# ──────────────────────────────────────────────
+# 7. FICHIERS SENSIBLES
+# ──────────────────────────────────────────────
+SENSITIVE_PATHS = [
+    "/.env", "/.git/config", "/config.php", "/config.yml", "/config.json",
+    "/wp-config.php", "/phpinfo.php", "/.htaccess", "/backup.zip",
+    "/backup.sql", "/database.sql", "/dump.sql", "/admin", "/admin.php",
+    "/login", "/.DS_Store", "/web.config", "/server-status", "/robots.txt",
+]
+
+def check_sensitive_files(base_url: str):
+    print("[*] Fichiers sensibles...")
+    base = base_url.rstrip("/")
+    for path in SENSITIVE_PATHS:
+        r = get(base + path)
+        if r and r.status_code == 200 and len(r.text) > 20:
+            sev = "HIGH" if any(k in r.text.lower() for k in
+                                ["password", "secret", "db_", "api_key", "[core]"]) else "MEDIUM"
+            add_finding("Fichier sensible exposé",
+                        f"HTTP 200 — {path} ({len(r.text)} octets)",
+                        base + path, sev)
+
+# ──────────────────────────────────────────────
+# 8. CSRF
+# ──────────────────────────────────────────────
+TOKEN_NAMES = ["csrf", "token", "_token", "authenticity_token",
+               "csrfmiddlewaretoken", "nonce", "__RequestVerificationToken"]
+
+def check_csrf(forms: list[dict]):
+    print("[*] CSRF...")
+    for form in forms:
+        if form["method"] != "post":
+            continue
+        has_token = any(any(t in k.lower() for t in TOKEN_NAMES) for k in form["inputs"])
+        if not has_token:
+            add_finding("CSRF — token absent",
+                        f"POST sans token sur {form['page']}",
+                        form["action"], "MEDIUM")
+
+# ──────────────────────────────────────────────
+# 9. SSL/TLS
+# ──────────────────────────────────────────────
+def check_ssl(base_url: str):
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https":
+        add_finding("HTTP only", "Site non chiffré, MitM trivial", base_url)
+        return
+    print("[*] SSL/TLS...")
+    host = parsed.netloc.split(":")[0]
+    port = int(parsed.netloc.split(":")[1]) if ":" in parsed.netloc else 443
+
+    import subprocess
+    import warnings
+
+    for proto_name, openssl_flag in [("TLSv1", "tls1"), ("TLSv1.1", "tls1_1")]:
+        try:
+            result = subprocess.run(
+                [
+                    "openssl", "s_client",
+                    f"-{openssl_flag}",
+                    "-connect", f"{host}:{port}",
+                    "-servername", host,
+                ],
+                input=b"",
+                capture_output=True,
+                timeout=6,
+            )
+            output = result.stdout + result.stderr
+            if b"Cipher    :" in output or b"SSL handshake has read" in output:
+                add_finding(
+                    f"{proto_name} supporté",
+                    "Protocole obsolète — POODLE/BEAST possible",
+                    base_url, "MEDIUM"
+                )
+        except FileNotFoundError:
+            # openssl absent — fallback warning silencieux via le module ssl
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                try:
+                    import ssl as _ssl
+                    ver = getattr(_ssl.TLSVersion, "TLSv1" if proto_name == "TLSv1" else "TLSv1_1", None)
+                    if ver is None:
+                        continue
+                    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = _ssl.CERT_NONE
+                    ctx.minimum_version = ver
+                    ctx.maximum_version = ver
+                    import socket as _socket
+                    with _socket.create_connection((host, port), timeout=TIMEOUT) as sock:
+                        with ctx.wrap_socket(sock, server_hostname=host):
+                            add_finding(
+                                f"{proto_name} supporté",
+                                "Protocole obsolète — POODLE/BEAST possible",
+                                base_url, "MEDIUM"
+                            )
+                except Exception:
+                    pass
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
+# ──────────────────────────────────────────────
+# RAPPORT
+# ──────────────────────────────────────────────
+def report(target: str):
+    print("\n" + "═"*60)
+    print(f"  RAPPORT FINAL — {target}")
+    print("═"*60)
+    if not FINDINGS:
+        print("  Aucune faille exploitable détectée.\n")
+        return
+    high   = [f for f in FINDINGS if f["severity"] == "HIGH"]
+    medium = [f for f in FINDINGS if f["severity"] == "MEDIUM"]
+    print(f"  HIGH   : {len(high)}")
+    print(f"  MEDIUM : {len(medium)}")
+    print(f"  TOTAL  : {len(FINDINGS)}\n")
+    out = "findings.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(FINDINGS, f, indent=2, ensure_ascii=False)
+    print(f"  Export JSON → {out}\n")
+
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
+def main():
+    target = get_target()
+    print(f"\n[*] Cible : {target}\n")
+
+    urls, forms = crawl(target)
+
+    check_ssl(target)
+    check_headers(target)
+    check_sensitive_files(target)
+    check_xss(urls, forms)
+    check_sqli(urls, forms)
+    check_open_redirect(urls)
+    check_idor(urls)
+    check_csrf(forms)
+
+    report(target)
+
+if __name__ == "__main__":
+    main()
